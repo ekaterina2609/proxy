@@ -90,7 +90,42 @@ def create_google_connection(client_id: str, api_key: str):
             # Создаем соединение к Google
             async def connect_and_forward():
                 try:
-                    google_ws = await websockets.connect(google_ws_url, extra_headers=headers)
+                    # ПРОБЛЕМА: websockets.connect() с extra_headers не работает с eventlet/asyncio
+                    # РЕШЕНИЕ: API ключ уже передается через query параметр ?key=api_key в URL
+                    # Дополнительный заголовок x-goog-api-key не нужен, так как ключ в URL
+                    # Если Google API требует заголовок, используем подкласс WebSocketClientProtocol
+                    
+                    try:
+                        # Пробуем подключиться без extra_headers (ключ уже в URL)
+                        google_ws = await websockets.connect(google_ws_url)
+                    except Exception as e1:
+                        logger.warning(f"Ошибка подключения без заголовков: {e1}, пробую с подклассом")
+                        # Если не работает, пробуем создать кастомный протокол
+                        from websockets.client import WebSocketClientProtocol
+                        
+                        class HeaderWebSocketProtocol(WebSocketClientProtocol):
+                            """WebSocket протокол с поддержкой дополнительных заголовков"""
+                            def __init__(self, *args, custom_headers=None, **kwargs):
+                                self.custom_headers = custom_headers or {}
+                                super().__init__(*args, **kwargs)
+                            
+                            async def handshake(self, *args, **kwargs):
+                                # Добавляем заголовки во время handshake
+                                if self.custom_headers:
+                                    for key, value in self.custom_headers.items():
+                                        self.request_headers[key] = value
+                                return await super().handshake(*args, **kwargs)
+                        
+                        try:
+                            # Используем кастомный протокол с заголовками
+                            google_ws = await websockets.connect(
+                                google_ws_url,
+                                create_protocol=lambda: HeaderWebSocketProtocol(custom_headers=headers)
+                            )
+                        except Exception as e2:
+                            logger.error(f"Ошибка подключения с кастомным протоколом: {e2}")
+                            raise e2
+                    
                     google_connections[client_id] = google_ws
                     logger.info(f"✅ Соединение с Google API установлено для {client_id}")
                     
