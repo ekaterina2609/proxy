@@ -80,11 +80,11 @@ def create_google_connection(client_id: str, api_key: str):
         # Создаем новый event loop в отдельном потоке
         def run_async_in_thread():
             """Запускает async функцию в отдельном потоке с собственным event loop"""
+            # Создаем новый event loop для этого потока ДО monkey patching
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
             try:
-                # Создаем новый event loop для этого потока
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                
                 async def connect_and_forward():
                     try:
                         # Подключаемся к Google WebSocket API
@@ -172,24 +172,29 @@ def create_google_connection(client_id: str, api_key: str):
                             del google_connections[client_id]
                 
                 # Запускаем async функцию
-                # ВАЖНО: gevent monkey patching может конфликтовать с asyncio
+                # ВАЖНО: gevent monkey patching конфликтует с asyncio
                 # Используем nest_asyncio для совместимости
                 try:
                     import nest_asyncio
                     nest_asyncio.apply(loop)
-                    loop.run_until_complete(connect_and_forward())
                 except ImportError:
-                    # Если nest_asyncio не установлен, пробуем без него
-                    # Это может не сработать с gevent
-                    try:
-                        loop.run_until_complete(connect_and_forward())
-                    except RuntimeError as e:
-                        if "cannot be called from a running event loop" in str(e):
-                            # Если loop уже запущен, используем asyncio.run в отдельном процессе
-                            logger.error(f"Конфликт event loop: {e}. Используйте threading.Thread вместо gevent для asyncio операций.")
+                    logger.warning("nest_asyncio не установлен. Установите: pip install nest-asyncio. Пробую без него...")
+                
+                # Запускаем функцию в event loop
+                try:
+                    loop.run_until_complete(connect_and_forward())
+                except RuntimeError as e:
+                    if "cannot be called from a running event loop" in str(e):
+                        logger.error(f"Конфликт event loop: {e}")
+                        # Пробуем использовать task
+                        try:
+                            task = loop.create_task(connect_and_forward())
+                            loop.run_until_complete(task)
+                        except Exception as task_error:
+                            logger.error(f"Ошибка с create_task: {task_error}")
                             raise
-                        else:
-                            raise
+                    else:
+                        raise
             except Exception as e:
                 logger.error(f"Ошибка в run_async_in_thread: {e}", exc_info=True)
                 socketio.emit('error', {'message': str(e)}, room=client_id)
