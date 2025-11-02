@@ -18,6 +18,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 from gevent import monkey
+import gevent
 monkey.patch_all()  # Патчим для совместимости с asyncio и threading
 
 # Настройка логирования
@@ -88,20 +89,27 @@ def create_google_connection(client_id: str, api_key: str):
                     try:
                         # Подключаемся к Google WebSocket API
                         # API ключ уже в URL через ?key=api_key
-                        # websockets использует httpx под капотом, который читает HTTP_PROXY/HTTPS_PROXY
+                        # ВАЖНО: websockets НЕ поддерживает HTTP прокси для WebSocket соединений
+                        # HTTP прокси работает только для HTTP, но не для WebSocket upgrade
                         if proxy_config:
-                            # Устанавливаем переменные окружения для этого потока
+                            logger.info(f"⚠️ Прокси настроен: {proxy_config['url']}")
+                            logger.warning("⚠️ websockets может не поддерживать HTTP прокси для WebSocket. Будет использоваться прямое подключение.")
+                            
+                            # Пробуем подключиться через прокси (может не сработать)
                             original_http_proxy = os.environ.get('HTTP_PROXY')
                             original_https_proxy = os.environ.get('HTTPS_PROXY')
                             
                             try:
                                 os.environ['HTTP_PROXY'] = proxy_config['url']
                                 os.environ['HTTPS_PROXY'] = proxy_config['url']
-                                logger.info(f"Прокси установлен для websockets: {proxy_config['url']}")
                                 
-                                # websockets использует httpx, который читает HTTP_PROXY/HTTPS_PROXY
+                                # Пробуем подключиться
                                 google_ws = await websockets.connect(google_ws_url)
-                            finally:
+                                logger.info(f"✅ Подключение через прокси успешно (маловероятно для WebSocket)")
+                            except Exception as proxy_error:
+                                logger.error(f"❌ Ошибка через HTTP прокси: {proxy_error}")
+                                logger.warning("⚠️ Используется прямое подключение (Render сервер вне блокировок)")
+                                
                                 # Восстанавливаем переменные окружения
                                 if original_http_proxy:
                                     os.environ['HTTP_PROXY'] = original_http_proxy
@@ -110,6 +118,19 @@ def create_google_connection(client_id: str, api_key: str):
                                 if original_https_proxy:
                                     os.environ['HTTPS_PROXY'] = original_https_proxy
                                 elif 'HTTPS_PROXY' in os.environ:
+                                    del os.environ['HTTPS_PROXY']
+                                
+                                # Прямое подключение (Render сервер находится вне РФ/Беларуси, поэтому доступен)
+                                google_ws = await websockets.connect(google_ws_url)
+                            finally:
+                                # Финальное восстановление переменных окружения
+                                if original_http_proxy and os.environ.get('HTTP_PROXY') == proxy_config['url']:
+                                    os.environ['HTTP_PROXY'] = original_http_proxy
+                                elif 'HTTP_PROXY' in os.environ and os.environ['HTTP_PROXY'] == proxy_config['url']:
+                                    del os.environ['HTTP_PROXY']
+                                if original_https_proxy and os.environ.get('HTTPS_PROXY') == proxy_config['url']:
+                                    os.environ['HTTPS_PROXY'] = original_https_proxy
+                                elif 'HTTPS_PROXY' in os.environ and os.environ['HTTPS_PROXY'] == proxy_config['url']:
                                     del os.environ['HTTPS_PROXY']
                         else:
                             # Прямое подключение без прокси
@@ -182,9 +203,8 @@ def handle_connect(auth):
     if api_key:
         client_api_keys[client_id] = api_key
         logger.info(f"API ключ получен для {client_id}: {api_key[:10]}...")
-        # Создаем соединение к Google в отдельном потоке
-        thread = threading.Thread(target=create_google_connection, args=(client_id, api_key), daemon=True)
-        thread.start()
+        # Создаем соединение к Google в отдельном greenlet через gevent
+        gevent.spawn(create_google_connection, client_id, api_key)
     
     emit('connected', {'status': 'connected', 'client_id': client_id})
 
@@ -198,7 +218,7 @@ def handle_disconnect():
     if client_id in google_connections:
         try:
             google_ws = google_connections[client_id]
-            # Закрываем в отдельном greenlet через eventlet
+            # Закрываем в отдельном потоке
             def close_connection():
                 try:
                     loop = asyncio.get_event_loop()
@@ -233,8 +253,7 @@ def handle_message(data):
         # Проверяем наличие соединения к Google
         if client_id not in google_connections:
             logger.warning(f"Соединение к Google не создано для {client_id}, создаю...")
-            thread = threading.Thread(target=create_google_connection, args=(client_id, api_key), daemon=True)
-            thread.start()
+            gevent.spawn(create_google_connection, client_id, api_key)
             emit('info', {'message': 'Connecting to Google...'}, room=client_id)
             return
         
@@ -288,7 +307,8 @@ def handle_init(data):
         logger.info(f"Инициализировано соединение {client_id} с API ключом: {api_key[:10]}...")
         
         # Создаем соединение к Google в отдельном greenlet
-        eventlet.spawn_n(create_google_connection, client_id, api_key)
+        # Используем gevent для запуска функции (gevent уже импортирован)
+        gevent.spawn(create_google_connection, client_id, api_key)
         
         emit('initialized', {'status': 'ok', 'client_id': client_id})
         
