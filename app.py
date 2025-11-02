@@ -17,10 +17,9 @@ from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
-import eventlet
 
-# Патчим eventlet для поддержки asyncio
-eventlet.monkey_patch()
+# ВАЖНО: НЕ используем eventlet.monkey_patch() при async_mode='threading'
+# eventlet несовместим с asyncio
 
 # Настройка логирования
 logging.basicConfig(
@@ -37,7 +36,8 @@ app = Flask(__name__)
 CORS(app)  # Разрешаем CORS для всех доменов
 
 # Инициализация SocketIO
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', logger=True, engineio_logger=True)
+# Используем threading вместо eventlet для совместимости с asyncio
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', logger=True, engineio_logger=True)
 
 # Хранилище активных WebSocket соединений к Google
 google_connections = {}
@@ -66,100 +66,104 @@ def get_proxy_config():
 def create_google_connection(client_id: str, api_key: str):
     """
     Создает соединение к Google API через HTTP прокси
-    Запускается в отдельном greenlet для каждого клиента через eventlet
+    Запускается в отдельном потоке для каждого клиента
     """
     try:
         proxy_config = get_proxy_config()
         google_ws_url = f"{GEMINI_WS_URL}?key={api_key}"
         
-        # Устанавливаем прокси если есть
-        original_http_proxy = os.environ.get('HTTP_PROXY')
-        original_https_proxy = os.environ.get('HTTPS_PROXY')
-        
+        logger.info(f"Подключение к Google API: {google_ws_url[:80]}...")
         if proxy_config:
-            os.environ['HTTP_PROXY'] = proxy_config['url']
-            os.environ['HTTPS_PROXY'] = proxy_config['url']
-            logger.info(f"Подключение через прокси {proxy_config['host']}:{proxy_config['port']}")
+            logger.info(f"Используется HTTP прокси: {proxy_config['host']}:{proxy_config['port']}")
         
-        try:
-            # ВАЖНО: eventlet уже запускает event loop, не создаем новый
-            # Используем eventlet.spawn для запуска асинхронного кода в greenlet
-            
-            async def connect_and_forward():
-                try:
-                    # Подключаемся к Google WebSocket API
-                    # API ключ уже в URL через ?key=api_key, дополнительный заголовок не нужен
-                    logger.info(f"Подключение к Google API: {google_ws_url[:80]}...")
-                    google_ws = await websockets.connect(google_ws_url)
-                    google_connections[client_id] = google_ws
-                    logger.info(f"✅ Соединение с Google API установлено для {client_id}")
-                    
-                    # Запускаем задачу для чтения от Google
-                    async def read_from_google():
-                        try:
-                            async for message in google_ws:
-                                # Отправляем клиенту через SocketIO
-                                socketio.emit('gemini_message', {
-                                    'data': message.decode('utf-8') if isinstance(message, bytes) else message,
-                                    'type': 'text' if isinstance(message, str) else 'binary'
-                                }, room=client_id)
-                                logger.debug(f"Получено сообщение от Google для {client_id}")
-                        except websockets.exceptions.ConnectionClosed:
-                            logger.info(f"Соединение с Google закрыто для {client_id}")
-                            if client_id in google_connections:
-                                del google_connections[client_id]
-                        except Exception as e:
-                            logger.error(f"Ошибка при чтении от Google: {e}", exc_info=True)
-                            if client_id in google_connections:
-                                try:
-                                    await google_connections[client_id].close()
-                                except:
-                                    pass
-                                del google_connections[client_id]
-                    
-                    # Запускаем чтение
-                    await read_from_google()
-                    
-                except Exception as e:
-                    logger.error(f"Ошибка подключения к Google: {e}", exc_info=True)
-                    socketio.emit('error', {'message': str(e)}, room=client_id)
-                    if client_id in google_connections:
-                        del google_connections[client_id]
-            
-            # ВАЖНО: eventlet уже запускает event loop через monkey patching
-            # Используем eventlet.spawn для запуска async функции в greenlet
-            # НО asyncio.run() не работает внутри eventlet, нужно использовать get_event_loop()
-            
-            def run_async_in_eventlet():
-                """Запускает async функцию внутри eventlet greenlet"""
-                try:
-                    # Пробуем получить существующий event loop от eventlet
+        # Создаем новый event loop в отдельном потоке
+        def run_async_in_thread():
+            """Запускает async функцию в отдельном потоке с собственным event loop"""
+            try:
+                # Создаем новый event loop для этого потока
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                async def connect_and_forward():
                     try:
-                        loop = asyncio.get_event_loop()
-                    except RuntimeError:
-                        # Если нет event loop, создаем новый в этом greenlet
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                    
-                    # Запускаем async функцию
-                    loop.run_until_complete(connect_and_forward())
-                except Exception as e:
-                    logger.error(f"Ошибка в run_async_in_eventlet: {e}", exc_info=True)
-                    socketio.emit('error', {'message': str(e)}, room=client_id)
-            
-            # Запускаем в отдельном greenlet
-            eventlet.spawn_n(run_async_in_eventlet)
-            
-        finally:
-            # Восстанавливаем переменные окружения
-            if original_http_proxy:
-                os.environ['HTTP_PROXY'] = original_http_proxy
-            elif 'HTTP_PROXY' in os.environ:
-                del os.environ['HTTP_PROXY']
-            if original_https_proxy:
-                os.environ['HTTPS_PROXY'] = original_https_proxy
-            elif 'HTTPS_PROXY' in os.environ:
-                del os.environ['HTTPS_PROXY']
+                        # Подключаемся к Google WebSocket API
+                        # API ключ уже в URL через ?key=api_key
+                        # websockets использует httpx под капотом, который читает HTTP_PROXY/HTTPS_PROXY
+                        if proxy_config:
+                            # Устанавливаем переменные окружения для этого потока
+                            original_http_proxy = os.environ.get('HTTP_PROXY')
+                            original_https_proxy = os.environ.get('HTTPS_PROXY')
+                            
+                            try:
+                                os.environ['HTTP_PROXY'] = proxy_config['url']
+                                os.environ['HTTPS_PROXY'] = proxy_config['url']
+                                logger.info(f"Прокси установлен для websockets: {proxy_config['url']}")
+                                
+                                # websockets использует httpx, который читает HTTP_PROXY/HTTPS_PROXY
+                                google_ws = await websockets.connect(google_ws_url)
+                            finally:
+                                # Восстанавливаем переменные окружения
+                                if original_http_proxy:
+                                    os.environ['HTTP_PROXY'] = original_http_proxy
+                                elif 'HTTP_PROXY' in os.environ:
+                                    del os.environ['HTTP_PROXY']
+                                if original_https_proxy:
+                                    os.environ['HTTPS_PROXY'] = original_https_proxy
+                                elif 'HTTPS_PROXY' in os.environ:
+                                    del os.environ['HTTPS_PROXY']
+                        else:
+                            # Прямое подключение без прокси
+                            google_ws = await websockets.connect(google_ws_url)
+                        
+                        google_connections[client_id] = google_ws
+                        logger.info(f"✅ Соединение с Google API установлено для {client_id}")
+                        
+                        # Запускаем задачу для чтения от Google
+                        async def read_from_google():
+                            try:
+                                async for message in google_ws:
+                                    # Отправляем клиенту через SocketIO
+                                    socketio.emit('gemini_message', {
+                                        'data': message.decode('utf-8') if isinstance(message, bytes) else message,
+                                        'type': 'text' if isinstance(message, str) else 'binary'
+                                    }, room=client_id)
+                                    logger.debug(f"Получено сообщение от Google для {client_id}")
+                            except websockets.exceptions.ConnectionClosed:
+                                logger.info(f"Соединение с Google закрыто для {client_id}")
+                                if client_id in google_connections:
+                                    del google_connections[client_id]
+                            except Exception as e:
+                                logger.error(f"Ошибка при чтении от Google: {e}", exc_info=True)
+                                if client_id in google_connections:
+                                    try:
+                                        await google_connections[client_id].close()
+                                    except:
+                                        pass
+                                    del google_connections[client_id]
+                        
+                        # Запускаем чтение
+                        await read_from_google()
+                        
+                    except Exception as e:
+                        logger.error(f"Ошибка подключения к Google: {e}", exc_info=True)
+                        socketio.emit('error', {'message': str(e)}, room=client_id)
+                        if client_id in google_connections:
+                            del google_connections[client_id]
+                
+                # Запускаем async функцию
+                loop.run_until_complete(connect_and_forward())
+            except Exception as e:
+                logger.error(f"Ошибка в run_async_in_thread: {e}", exc_info=True)
+                socketio.emit('error', {'message': str(e)}, room=client_id)
+            finally:
+                try:
+                    loop.close()
+                except:
+                    pass
+        
+        # Запускаем в отдельном потоке
+        thread = threading.Thread(target=run_async_in_thread, daemon=True)
+        thread.start()
                 
     except Exception as e:
         logger.error(f"Ошибка создания соединения к Google: {e}", exc_info=True)
@@ -178,9 +182,9 @@ def handle_connect(auth):
     if api_key:
         client_api_keys[client_id] = api_key
         logger.info(f"API ключ получен для {client_id}: {api_key[:10]}...")
-        # Создаем соединение к Google в отдельном greenlet через eventlet
-        # НЕ используем threading.Thread, т.к. eventlet лучше работает с greenlets
-        eventlet.spawn_n(create_google_connection, client_id, api_key)
+        # Создаем соединение к Google в отдельном потоке
+        thread = threading.Thread(target=create_google_connection, args=(client_id, api_key), daemon=True)
+        thread.start()
     
     emit('connected', {'status': 'connected', 'client_id': client_id})
 
@@ -205,7 +209,8 @@ def handle_disconnect():
                     loop.run_until_complete(google_ws.close())
                 except:
                     pass
-            eventlet.spawn_n(close_connection)
+            thread = threading.Thread(target=close_connection, daemon=True)
+            thread.start()
         except:
             pass
         del google_connections[client_id]
@@ -228,7 +233,8 @@ def handle_message(data):
         # Проверяем наличие соединения к Google
         if client_id not in google_connections:
             logger.warning(f"Соединение к Google не создано для {client_id}, создаю...")
-            eventlet.spawn_n(create_google_connection, client_id, api_key)
+            thread = threading.Thread(target=create_google_connection, args=(client_id, api_key), daemon=True)
+            thread.start()
             emit('info', {'message': 'Connecting to Google...'}, room=client_id)
             return
         
@@ -260,7 +266,8 @@ def handle_message(data):
                 logger.error(f"Ошибка при отправке к Google: {e}", exc_info=True)
                 socketio.emit('error', {'message': str(e)}, room=client_id)
         
-        eventlet.spawn_n(send_to_google)
+            thread = threading.Thread(target=send_to_google, daemon=True)
+            thread.start()
         
     except Exception as e:
         logger.error(f"Ошибка обработки сообщения: {e}", exc_info=True)
@@ -350,7 +357,7 @@ def run_server():
     logger.info("📡 WebSocket доступен через Socket.IO: /socket.io/")
     logger.info("💡 Клиент должен использовать Socket.IO библиотеку для подключения")
     
-    # Запускаем Flask с SocketIO через eventlet
+    # Запускаем Flask с SocketIO через threading
     socketio.run(
         app,
         host='0.0.0.0',
