@@ -7,4 +7,5 @@ eventlet==0.33.3
 requests==2.31.0
 gunicorn
 websockets
+flask-cors
 
