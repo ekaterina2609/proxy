@@ -1,12 +1,8 @@
 # WebSocket прокси сервер для Google Gemini Live API
-flask>=3.0.0
-flask-cors>=4.0.0
-flask-socketio>=5.3.6
-websockets>=12.0
-python-dotenv>=1.0.0
-httpx>=0.25.0
-gunicorn>=21.2.0
-gevent>=23.9.0
-gevent-websocket>=0.10.1
-nest-asyncio>=1.6.0
+flask==3.0.3
+flask-socketio==4.3.1
+python-engineio==3.13.2
+python-socketio==4.6.0
+eventlet==0.33.3
+requests==2.31.0
 
