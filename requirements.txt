@@ -6,4 +6,5 @@ python-socketio==4.6.0
 eventlet==0.33.3
 requests==2.31.0
 gunicorn
+websockets
 
